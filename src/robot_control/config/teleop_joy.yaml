@@ -1,0 +1,17 @@
+teleop_twist_joy_node:
+  ros__parameters:
+    require_enable_button: true
+    enable_button: 5
+
+    axis_linear:
+      x: 1
+    scale_linear:
+      x: 0.30        # symmetric forward & reverse
+
+    axis_angular:
+      yaw: 0
+    scale_angular:
+      yaw: 1.8
+
+    deadzone: 0.15
+    inverted_reverse: false   # IMPORTANT
