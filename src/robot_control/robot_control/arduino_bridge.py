@@ -11,7 +11,11 @@ class ArduinoBridge(Node):
     def __init__(self):
         super().__init__('arduino_bridge')
 
-        self.serial = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.01)
+        self.serial = serial.Serial(
+            '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0',
+            115200,
+            timeout=0.1
+        )
 
         self.create_subscription(Twist, '/cmd_vel', self.cmd_callback, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
