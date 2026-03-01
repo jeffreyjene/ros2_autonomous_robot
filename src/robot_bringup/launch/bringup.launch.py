@@ -152,20 +152,5 @@ def generate_launch_description():
         # ========================
         # Nav2 (localization + navigation)
         # ========================
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(
-                    get_package_share_directory('nav2_bringup'),
-                    'launch',
-                    'navigation_launch.py'
-                )
-            ),
-            launch_arguments={
-                'use_sim_time': 'false',
-                'map': map_yaml,
-                'params_file': nav2_config,
-                'cmd_vel': '/cmd_vel_nav',
-            }.items(),
-            condition=IfCondition(use_nav2),
-        ),
+        
     ])
