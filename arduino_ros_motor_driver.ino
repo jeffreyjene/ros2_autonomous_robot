@@ -1,161 +1,399 @@
+/*
+  ROS2 Differential Drive Robot Controller
+  Hardware:
+  - TB6612FNG motor driver
+  - 6V 120:1 motors
+  - 65mm wheels
+  - 1940 ticks/rev encoders
+
+  Serial protocol (matches arduino_bridge.py)
+
+  RX:
+  $CMD,linear,angular
+
+  TX:
+  $ODOM,x,y,yaw,linear,angular
+*/
+
 #include <Arduino.h>
 
-// ====================================================
-// ROBOT PARAMETERS
-// ====================================================
-const float WHEEL_RADIUS = 0.0325;     // meters
-const float WHEEL_BASE = 0.16;
-const float TICKS_PER_REV = 1940.0;
-const float CONTROL_DT = 0.01;          // 100 Hz
+//////////////////////////////////////////////////////////////
+// Robot geometry
+//////////////////////////////////////////////////////////////
 
-// ====================================================
-// SAFETY LIMITS (NON-NEGOTIABLE)
-// ====================================================
-const float MAX_FWD_V = 0.30;           // m/s forward
-const float MAX_REV_V = 0.15;           // m/s reverse (slower)
-const float MAX_WHEEL_W = 12.0;          // rad/s
-const float MAX_MEASURED_W = 20.0;       // sanity clamp
-const int   MAX_PWM = 150;               // NEVER 255
-const int   MIN_PWM = 20;                // overcome gearbox friction
-const float I_LIMIT = 2.0;               // integral clamp
+const float WHEEL_DIAMETER = 0.090;
+const float WHEEL_BASE = 0.20;
+const int TICKS_PER_REV = 1600;
 
-// ====================================================
-// TB6612 PINS
-// ====================================================
+const float WHEEL_CIRC = PI * WHEEL_DIAMETER;
+const float TICK_DIST = WHEEL_CIRC / TICKS_PER_REV;
+
+//////////////////////////////////////////////////////////////
+// Motor driver pins
+//////////////////////////////////////////////////////////////
+
+#define PWMA 5
 #define AIN1 7
 #define AIN2 8
-#define BIN2 9
-#define BIN1 10
-#define PWMA 5
+
 #define PWMB 6
+#define BIN1 9
+#define BIN2 10
+
 #define STBY 4
 
-// ====================================================
-// ENCODER PINS (QUADRATURE)
-// ====================================================
-#define ENCODER_L_A 2    // interrupt
-#define ENCODER_L_B 11
+//////////////////////////////////////////////////////////////
+// Encoders
+//////////////////////////////////////////////////////////////
 
-#define ENCODER_R_A 3    // interrupt
-#define ENCODER_R_B 12
+#define L_ENC_A 2
+#define L_ENC_B 11
 
-volatile long left_ticks  = 0;
+#define R_ENC_A 3
+#define R_ENC_B 12
+
+volatile long left_ticks = 0;
 volatile long right_ticks = 0;
 
-long prev_left_ticks  = 0;
+//////////////////////////////////////////////////////////////
+// Robot state
+//////////////////////////////////////////////////////////////
+
+float x = 0;
+float y = 0;
+float yaw = 0;
+
+//////////////////////////////////////////////////////////////
+// Control timing
+//////////////////////////////////////////////////////////////
+
+const float CONTROL_HZ = 100.0;
+const float DT = 1.0 / CONTROL_HZ;
+
+unsigned long last_loop = 0;
+
+//////////////////////////////////////////////////////////////
+// Encoder velocity
+//////////////////////////////////////////////////////////////
+
+long prev_left_ticks = 0;
 long prev_right_ticks = 0;
 
-// ====================================================
-// ROBOT STATE (ODOM)
-// ====================================================
-float x = 0.0;
-float y = 0.0;
-float theta = 0.0;
+float left_vel = 0;
+float right_vel = 0;
 
-// ====================================================
-// COMMANDS
-// ====================================================
-float target_v = 0.0;
-float target_w = 0.0;
+float left_vel_f = 0;
+float right_vel_f = 0;
 
-// Wheel calibration (start near 1.0)
-const float LEFT_SCALE  = 1;
-const float RIGHT_SCALE = 1;
+const float FILTER = 0.7;
 
-// ====================================================
-// WHEEL TARGETS
-// ====================================================
-float target_w_l = 0.0;
-float target_w_r = 0.0;
-float measured_w_l = 0.0;
-float measured_w_r = 0.0;
+//////////////////////////////////////////////////////////////
+// Commands
+//////////////////////////////////////////////////////////////
 
-// ====================================================
-// PID CONTROLLER
-// ====================================================
-float Kp = 10.0;
-float Ki = 3.0;
-float Kd = 0.05;
+float linear_cmd = 0;
+float angular_cmd = 0;
 
-float err_l = 0.0, prev_err_l = 0.0, int_l = 0.0;
-float err_r = 0.0, prev_err_r = 0.0, int_r = 0.0;
+float linear_target = 0;
+float angular_target = 0;
 
-// ====================================================
-// TIMING
-// ====================================================
-unsigned long last_control = 0;
+float target_left = 0;
+float target_right = 0;
+
 unsigned long last_cmd_time = 0;
 
-// ====================================================
-// QUADRATURE ISRs  (THIS IS THE KEY FIX)
-// ====================================================
-void leftEncoderISR() {
-  if (digitalRead(ENCODER_L_B) == LOW) {
-    left_ticks++;    // forward
-  } else {
-    left_ticks--;    // reverse
-  }
+//////////////////////////////////////////////////////////////
+// Ramp limiting
+//////////////////////////////////////////////////////////////
+
+const float MAX_ACCEL = 0.9;
+const float MAX_ANG_ACCEL = 5.0;
+
+//////////////////////////////////////////////////////////////
+// PID
+//////////////////////////////////////////////////////////////
+
+float KP = 15;
+float KI = 10;
+float KD = 0;
+
+float left_i = 0;
+float right_i = 0;
+
+
+//for tuning the motors
+const float LEFT_GAIN = 1.0;
+const float RIGHT_GAIN = 1.0;
+
+//////////////////////////////////////////////////////////////
+// Feedforward
+//////////////////////////////////////////////////////////////
+
+const float FF_GAIN = 220.0;
+
+//////////////////////////////////////////////////////////////
+// Encoder interrupts
+//////////////////////////////////////////////////////////////
+
+void leftISR()
+{
+  if (digitalRead(L_ENC_A) == digitalRead(L_ENC_B))
+    left_ticks++;
+  else
+    left_ticks--;
 }
 
-void rightEncoderISR() {
-  if (digitalRead(ENCODER_R_B) == LOW) {
-    right_ticks--;   // forward
-  } else {
-    right_ticks++;   // reverse
-  }
+void rightISR()
+{
+  if (digitalRead(R_ENC_A) == digitalRead(R_ENC_B))
+    right_ticks--;
+  else
+    right_ticks++;
 }
 
-// ====================================================
-// MOTOR CONTROL (COAST MODE)
-// ====================================================
-void setMotor(int pwm, int in1, int in2, int pwmPin) {
+//////////////////////////////////////////////////////////////
+// Motor control
+//////////////////////////////////////////////////////////////
 
-  if (abs(pwm) < MIN_PWM) {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, LOW);   // COAST
-    analogWrite(pwmPin, 0);
-    return;
+void setMotorA(int pwm)
+{
+  pwm = constrain(pwm, -255, 255);
+
+  if (pwm > 0)
+  {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  }
+  else if (pwm < 0)
+  {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  }
+  else
+  {
+    // brake
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, HIGH);
   }
 
-  if (pwm > 0) {
-    digitalWrite(in1, HIGH);
-    digitalWrite(in2, LOW);
-  } else {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, HIGH);
-    pwm = -pwm;
-  }
-
-  analogWrite(pwmPin, constrain(pwm, 0, MAX_PWM));
+  analogWrite(PWMA, abs(pwm));
 }
 
-// ====================================================
-// SERIAL INPUT ($CMD,v,w)
-// ====================================================
-void readSerial() {
-  if (!Serial.available()) return;
+void setMotorB(int pwm)
+{
+  pwm = constrain(pwm, -255, 255);
 
-  String line = Serial.readStringUntil('\n');
+  // reversed motor direction
+  if (pwm > 0)
+  {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  }
+  else if (pwm < 0)
+  {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  }
+  else
+  {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, HIGH);
+  }
+
+  analogWrite(PWMB, abs(pwm));
+}
+
+//////////////////////////////////////////////////////////////
+// Serial command parser
+//////////////////////////////////////////////////////////////
+
+String buffer;
+
+void parseCommand(String line)
+{
   if (!line.startsWith("$CMD")) return;
 
-  int first = line.indexOf(',');
-  int second = line.indexOf(',', first + 1);
-  if (first < 0 || second < 0) return;
+  int c1 = line.indexOf(',');
+  int c2 = line.indexOf(',', c1 + 1);
 
-  float v = line.substring(first + 1, second).toFloat();
-  float w = line.substring(second + 1).toFloat();
+  if (c1 < 0 || c2 < 0) return;
 
-  if (abs(v) > 1.0 || abs(w) > 5.0) return;
+  linear_cmd = line.substring(c1 + 1, c2).toFloat();
+  angular_cmd = line.substring(c2 + 1).toFloat();
 
-  target_v = v;
-  target_w = w;
   last_cmd_time = millis();
 }
 
-// ====================================================
-// SETUP
-// ====================================================
-void setup() {
+//////////////////////////////////////////////////////////////
+// Safe encoder read
+//////////////////////////////////////////////////////////////
+
+void readEncoders(long &l, long &r)
+{
+  noInterrupts();
+  l = left_ticks;
+  r = right_ticks;
+  interrupts();
+}
+
+//////////////////////////////////////////////////////////////
+// Control loop
+//////////////////////////////////////////////////////////////
+
+void controlLoop()
+{
+
+  //////////////////////////////////////////////////////////
+  // watchdog
+  //////////////////////////////////////////////////////////
+
+  if (millis() - last_cmd_time > 150)
+  {
+    linear_cmd = 0;
+    angular_cmd = 0;
+  }
+
+  //////////////////////////////////////////////////////////
+  // velocity ramp limiting
+  //////////////////////////////////////////////////////////
+
+  float d_lin = linear_cmd - linear_target;
+
+  float accel = MAX_ACCEL;
+  float decel = MAX_ACCEL * 2.0;  // brake twice as fast
+
+  float max_step;
+
+  if (d_lin > 0)
+    max_step = accel * DT;
+  else
+    max_step = decel * DT;
+
+  if (d_lin > max_step) d_lin = max_step;
+  if (d_lin < -max_step) d_lin = -max_step;
+
+  linear_target += d_lin;
+
+  float d_ang = angular_cmd - angular_target;
+  float max_ang = MAX_ANG_ACCEL * DT;
+
+  if (d_ang > max_ang) d_ang = max_ang;
+  if (d_ang < -max_ang) d_ang = -max_ang;
+
+  angular_target += d_ang;
+
+  //////////////////////////////////////////////////////////
+  // hard stop when command is zero
+  //////////////////////////////////////////////////////////
+
+  if (abs(linear_target) < 0.001 && abs(angular_target) < 0.001)
+  {
+    setMotorA(0);
+    setMotorB(0);
+
+    left_i = 0;
+    right_i = 0;
+
+    return;
+  }
+
+  //////////////////////////////////////////////////////////
+  // convert to wheel velocities
+  //////////////////////////////////////////////////////////
+
+  target_left =
+      linear_target - angular_target * WHEEL_BASE / 2.0;
+
+  target_right =
+      linear_target + angular_target * WHEEL_BASE / 2.0;
+
+  //////////////////////////////////////////////////////////
+  // encoder update
+  //////////////////////////////////////////////////////////
+
+  long l, r;
+  readEncoders(l, r);
+
+  long dl = l - prev_left_ticks;
+  long dr = r - prev_right_ticks;
+
+  prev_left_ticks = l;
+  prev_right_ticks = r;
+
+  float left_dist  = -dl * TICK_DIST;
+  float right_dist = -dr * TICK_DIST;
+
+  left_vel = left_dist / DT;
+  right_vel = right_dist / DT;
+
+  //////////////////////////////////////////////////////////
+  // velocity filtering
+  //////////////////////////////////////////////////////////
+
+  left_vel_f = FILTER * left_vel_f + (1 - FILTER) * left_vel;
+  right_vel_f = FILTER * right_vel_f + (1 - FILTER) * right_vel;
+
+  //////////////////////////////////////////////////////////
+  // PID + feedforward
+  //////////////////////////////////////////////////////////
+
+  float err_l = target_left - left_vel_f;
+  float err_r = target_right - right_vel_f;
+
+  left_i += err_l * DT;
+  right_i += err_r * DT;
+
+  left_i = constrain(left_i, -1, 1);
+  right_i = constrain(right_i, -1, 1);
+
+  float u_l =
+    (FF_GAIN * target_left +
+     KP * err_l +
+     KI * left_i) * LEFT_GAIN;
+
+  float u_r =
+      (FF_GAIN * target_right +
+      KP * err_r +
+      KI * right_i) * RIGHT_GAIN;
+
+  setMotorA(u_l);
+  setMotorB(u_r);
+
+  //////////////////////////////////////////////////////////
+  // odometry
+  //////////////////////////////////////////////////////////
+
+  float d = (left_dist + right_dist) / 2.0;
+  float dtheta = (right_dist - left_dist) / WHEEL_BASE;
+
+  float mid = yaw + dtheta * 0.5;
+
+  x += d * cos(mid);
+  y += d * sin(mid);
+  yaw += dtheta;
+
+  //////////////////////////////////////////////////////////
+  // publish odometry
+  //////////////////////////////////////////////////////////
+
+  Serial.print("$ODOM,");
+  Serial.print(x,4);
+  Serial.print(",");
+  Serial.print(y,4);
+  Serial.print(",");
+  Serial.print(yaw,4);
+  Serial.print(",");
+  Serial.print(d / DT,4);
+  Serial.print(",");
+  Serial.println(dtheta / DT,4);
+}
+
+//////////////////////////////////////////////////////////////
+// Setup
+//////////////////////////////////////////////////////////////
+
+void setup()
+{
   Serial.begin(115200);
 
   pinMode(AIN1, OUTPUT);
@@ -169,110 +407,46 @@ void setup() {
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
 
-  pinMode(ENCODER_L_A, INPUT_PULLUP);
-  pinMode(ENCODER_L_B, INPUT_PULLUP);
-  pinMode(ENCODER_R_A, INPUT_PULLUP);
-  pinMode(ENCODER_R_B, INPUT_PULLUP);
+  pinMode(L_ENC_A, INPUT_PULLUP);
+  pinMode(L_ENC_B, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(ENCODER_L_A), leftEncoderISR, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_R_A), rightEncoderISR, RISING);
+  pinMode(R_ENC_A, INPUT_PULLUP);
+  pinMode(R_ENC_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(L_ENC_A), leftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_A), rightISR, CHANGE);
+
+  last_loop = millis();
+  last_cmd_time = millis();
+
+  Serial.println("$DEBUG,READY");
 }
 
-// ====================================================
-// MAIN LOOP
-// ====================================================
-void loop() {
-  readSerial();
+//////////////////////////////////////////////////////////////
+// Main loop
+//////////////////////////////////////////////////////////////
 
-  if (millis() - last_control >= 10) {
+void loop()
+{
+
+  while (Serial.available())
+  {
+    char c = Serial.read();
+
+    if (c == '\n')
+    {
+      parseCommand(buffer);
+      buffer = "";
+    }
+    else
+    {
+      buffer += c;
+    }
+  }
+
+  if (millis() - last_loop >= 10)
+  {
+    last_loop += 10;
     controlLoop();
-    last_control = millis();
   }
-}
-
-// ====================================================
-// CONTROL LOOP
-// ====================================================
-void controlLoop() {
-
-  // ---------- TIMEOUT SAFETY ----------
-  if (millis() - last_cmd_time > 500) {
-    target_v = 0;
-    target_w = 0;
-    int_l = int_r = 0;
-    prev_err_l = prev_err_r = 0;
-  }
-
-  // ---------- LINEAR VELOCITY LIMITS ----------
-  if (target_v > MAX_FWD_V) {
-    target_v = MAX_FWD_V;
-  } else if (target_v < -MAX_REV_V) {
-    target_v = -MAX_REV_V;
-  }
-
-  // ---------- CMD → WHEEL TARGETS ----------
-  target_w_l = (target_v - (WHEEL_BASE / 2.0) * target_w) / WHEEL_RADIUS;
-  target_w_r = (target_v + (WHEEL_BASE / 2.0) * target_w) / WHEEL_RADIUS;
-
-  target_w_l = constrain(target_w_l, -MAX_WHEEL_W, MAX_WHEEL_W);
-  target_w_r = constrain(target_w_r, -MAX_WHEEL_W, MAX_WHEEL_W);
-
-  // ---------- ENCODERS ----------
-  long dL = left_ticks  - prev_left_ticks;
-  long dR = right_ticks - prev_right_ticks;
-
-  //Serial.print("$DEBUG,dL:");
-  //Serial.print(dL);
-  //Serial.print(",dR:");
-  //Serial.println(dR);
-
-  prev_left_ticks  = left_ticks;
-  prev_right_ticks = right_ticks;
-
-  measured_w_l = (dL / TICKS_PER_REV) * 2.0 * PI / CONTROL_DT;
-  measured_w_r = (dR / TICKS_PER_REV) * 2.0 * PI / CONTROL_DT;
-
-  measured_w_l = constrain(measured_w_l, -MAX_MEASURED_W, MAX_MEASURED_W);
-  measured_w_r = constrain(measured_w_r, -MAX_MEASURED_W, MAX_MEASURED_W);
-
-  // ---------- PID LEFT ----------
-  err_l = target_w_l - measured_w_l;
-  int_l += err_l * CONTROL_DT;
-  int_l = constrain(int_l, -I_LIMIT, I_LIMIT);
-  float pwm_l = Kp * err_l + Ki * int_l + Kd * ((err_l - prev_err_l) / CONTROL_DT);
-  prev_err_l = err_l;
-
-  // ---------- PID RIGHT ----------
-  err_r = target_w_r - measured_w_r;
-  int_r += err_r * CONTROL_DT;
-  int_r = constrain(int_r, -I_LIMIT, I_LIMIT);
-  float pwm_r = Kp * err_r + Ki * int_r + Kd * ((err_r - prev_err_r) / CONTROL_DT);
-  prev_err_r = err_r;
-
-  pwm_l = constrain(pwm_l, -MAX_PWM, MAX_PWM);
-  pwm_r = constrain(pwm_r, -MAX_PWM, MAX_PWM);
-
-  // ---------- APPLY MOTORS ----------
-  setMotor((int)pwm_l, AIN1, AIN2, PWMA);
-  setMotor((int)pwm_r, BIN1, BIN2, PWMB);
-
-  // ---------- ODOMETRY ----------
-  float dtheta_l = (dL / TICKS_PER_REV) * 2.0 * PI * LEFT_SCALE;
-  float dtheta_r = (dR / TICKS_PER_REV) * 2.0 * PI * RIGHT_SCALE;
-
-  float ds = WHEEL_RADIUS * (dtheta_r + dtheta_l) / 2.0;
-  float dtheta = WHEEL_RADIUS * (dtheta_r - dtheta_l) / WHEEL_BASE;
-
-  x     += ds * cos(theta + dtheta / 2.0);
-  y     += ds * sin(theta + dtheta / 2.0);
-  theta += dtheta;
-
-  // ---------- SEND ODOM ----------
-  Serial.print("$ODOM,");
-  Serial.print(x, 4); Serial.print(",");
-  Serial.print(y, 4); Serial.print(",");
-  Serial.print(theta, 4); Serial.print(",");
-  Serial.print(measured_w_l * WHEEL_RADIUS, 4); Serial.print(",");
-  Serial.println(measured_w_r * WHEEL_RADIUS, 4);
-
 }
